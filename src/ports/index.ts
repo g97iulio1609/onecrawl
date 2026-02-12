@@ -249,3 +249,9 @@ export interface StealthPort {
    */
   getRandomDelay(min?: number, max?: number): number;
 }
+
+// =============================================================================
+// Storage Port - Platform-agnostic key-value storage
+// =============================================================================
+
+export type { StoragePort } from "./storage.port.js";

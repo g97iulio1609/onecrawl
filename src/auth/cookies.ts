@@ -1,11 +1,9 @@
 /**
- * Cookie Manager - Import cookies from browsers and inject into requests
- * Enables access to authenticated content without browser automation.
+ * Cookie Manager - Import cookies and inject into requests
+ * Platform-agnostic: no direct fs/os/path imports.
  */
 
-import { readFile } from "fs/promises";
-import { homedir } from "os";
-import { join } from "path";
+import type { StoragePort } from "../ports/storage.port.js";
 
 /** Cookie structure */
 export interface Cookie {
@@ -37,11 +35,12 @@ export class MemoryCookieStore implements CookieStore {
     const cleanDomain = domain.replace(/^www\./, "");
 
     for (const [storedDomain, cookies] of this.cookies) {
-      // Match domain and parent domains
-      if (cleanDomain === storedDomain || cleanDomain.endsWith(`.${storedDomain}`)) {
+      if (
+        cleanDomain === storedDomain ||
+        cleanDomain.endsWith(`.${storedDomain}`)
+      ) {
         const now = Date.now() / 1000;
         for (const cookie of cookies) {
-          // Skip expired cookies
           if (cookie.expires && cookie.expires < now) continue;
           result.push(cookie);
         }
@@ -56,7 +55,6 @@ export class MemoryCookieStore implements CookieStore {
       const domain = cookie.domain.replace(/^\./, "");
       const existing = this.cookies.get(domain) ?? [];
 
-      // Replace existing cookie with same name
       const idx = existing.findIndex((c) => c.name === cookie.name);
       if (idx >= 0) {
         existing[idx] = cookie;
@@ -78,70 +76,13 @@ export class MemoryCookieStore implements CookieStore {
 }
 
 /**
- * Import cookies from Chrome browser
+ * Parse Netscape cookies.txt content into Cookie objects.
+ * Platform-agnostic: operates on string content only.
  */
-export async function importChromeCookies(
-  profile = "Default",
-): Promise<Cookie[]> {
-  const cookiePaths = [
-    // macOS
-    join(
-      homedir(),
-      "Library/Application Support/Google/Chrome",
-      profile,
-      "Cookies",
-    ),
-    // Linux
-    join(homedir(), ".config/google-chrome", profile, "Cookies"),
-    // Windows
-    join(
-      process.env.LOCALAPPDATA ?? "",
-      "Google/Chrome/User Data",
-      profile,
-      "Cookies",
-    ),
-  ];
-
-  // Note: Chrome cookies are encrypted. This requires additional decryption.
-  // For now, return empty - in production, use a library like `chrome-cookies-secure`
-  console.warn(
-    "Chrome cookie import requires decryption. Use chrome-cookies-secure or export manually.",
-  );
-
-  return [];
-}
-
-/**
- * Import cookies from Firefox browser
- */
-export async function importFirefoxCookies(
-  profile?: string,
-): Promise<Cookie[]> {
-  const firefoxPath =
-    process.platform === "darwin"
-      ? join(homedir(), "Library/Application Support/Firefox/Profiles")
-      : process.platform === "win32"
-        ? join(process.env.APPDATA ?? "", "Mozilla/Firefox/Profiles")
-        : join(homedir(), ".mozilla/firefox");
-
-  // Note: Firefox cookies are in SQLite. Would need better-sqlite3.
-  console.warn(
-    "Firefox cookie import requires SQLite. Use cookies.txt export instead.",
-  );
-
-  return [];
-}
-
-/**
- * Import cookies from Netscape cookies.txt format
- * This is the most portable format, exported by many browser extensions.
- */
-export async function importCookiesTxt(filePath: string): Promise<Cookie[]> {
-  const content = await readFile(filePath, "utf-8");
+export function parseCookiesTxt(content: string): Cookie[] {
   const cookies: Cookie[] = [];
 
   for (const line of content.split("\n")) {
-    // Skip comments and empty lines
     if (line.startsWith("#") || !line.trim()) continue;
 
     const parts = line.split("\t");
@@ -160,6 +101,27 @@ export async function importCookiesTxt(filePath: string): Promise<Cookie[]> {
   }
 
   return cookies;
+}
+
+/**
+ * Import cookies from a raw cookies.txt string.
+ * Alias for parseCookiesTxt for backward compatibility.
+ */
+export function importCookiesTxt(content: string): Cookie[] {
+  return parseCookiesTxt(content);
+}
+
+/**
+ * Import cookies from StoragePort by key.
+ * Reads a cookies.txt-formatted string from storage and parses it.
+ */
+export async function importCookiesTxtFromStorage(
+  storage: StoragePort,
+  key: string,
+): Promise<Cookie[]> {
+  const content = await storage.get(key);
+  if (!content) return [];
+  return parseCookiesTxt(content);
 }
 
 /**

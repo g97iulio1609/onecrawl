@@ -1,5 +1,6 @@
 /**
- * OneCrawl Auth - Cookie and proxy management
+ * OneCrawl Auth - React Native Compatible
+ * All cookie functions are now platform-agnostic via StoragePort.
  */
 
 export {

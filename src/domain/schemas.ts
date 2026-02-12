@@ -80,7 +80,7 @@ export const MetadataSchema = z.object({
   twitterImage: z.string().optional(),
   canonical: z.string().optional(),
   lang: z.string().optional(),
-  structuredData: z.array(z.record(z.unknown())).optional(),
+  structuredData: z.array(z.record(z.string(), z.unknown())).optional(),
 });
 
 export type Metadata = z.infer<typeof MetadataSchema>;

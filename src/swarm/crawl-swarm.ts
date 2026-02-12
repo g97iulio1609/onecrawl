@@ -7,10 +7,10 @@
  * - Coordinator: Manages queue, deduplication, rate limiting
  */
 
-import { ToolLoopAgent, tool, stepCountIs, type LanguageModel } from "ai";
-import { z } from "zod";
+import { ToolLoopAgent, stepCountIs, type LanguageModel } from "ai";
 import { createScrapeUseCase } from "../use-cases/scrape.use-case.js";
 import { createSearchUseCase } from "../use-cases/search.use-case.js";
+import { createSwarmTools } from "./swarm-tools.js";
 
 /** URL with priority and metadata */
 export interface PrioritizedUrl {
@@ -32,24 +32,17 @@ export interface CrawlResult {
 
 /** Swarm configuration */
 export interface SwarmConfig {
-  /** AI model for agents */
   model: LanguageModel;
-  /** Maximum concurrent workers */
   maxWorkers?: number;
-  /** Maximum URLs to crawl */
   maxUrls?: number;
-  /** Maximum depth */
   maxDepth?: number;
-  /** Domains to stay within (empty = all) */
   allowedDomains?: string[];
-  /** URL patterns to exclude */
   excludePatterns?: RegExp[];
-  /** Maximum steps per agent */
   maxSteps?: number;
 }
 
 /** Swarm state */
-interface SwarmState {
+export interface SwarmState {
   queue: PrioritizedUrl[];
   visited: Set<string>;
   results: Map<string, CrawlResult>;
@@ -76,12 +69,7 @@ export class CrawlSwarm {
       ...config,
     };
 
-    this.state = {
-      queue: [],
-      visited: new Set(),
-      results: new Map(),
-      activeWorkers: 0,
-    };
+    this.state = this.createInitialState();
   }
 
   private shouldCrawl(url: string): boolean {
@@ -107,9 +95,7 @@ export class CrawlSwarm {
     }
   }
 
-  /**
-   * Execute a goal-directed crawl using ToolLoopAgent
-   */
+  /** Execute a goal-directed crawl using ToolLoopAgent. */
   async crawl(
     goal: string,
     options: {
@@ -120,134 +106,22 @@ export class CrawlSwarm {
         step: string;
       }) => void;
     } = {},
-  ): Promise<{
-    results: CrawlResult[];
-    summary: string;
-  }> {
+  ): Promise<{ results: CrawlResult[]; summary: string }> {
     const { seedUrls = [], onProgress } = options;
 
-    // Add seed URLs to queue
     for (const url of seedUrls) {
       if (this.shouldCrawl(url)) {
         this.state.queue.push({ url, priority: 10, depth: 0 });
       }
     }
 
-    // Create tools bound to this instance
-    const searchWeb = tool({
-      description: "Search the web for URLs related to a query",
-      inputSchema: z.object({
-        query: z.string().describe("Search query"),
-        maxResults: z.number().default(10),
-      }),
-      execute: async ({ query, maxResults }) => {
-        const result = await this.searchUseCase.execute(query, { maxResults });
-        return (
-          result.results?.map((r) => ({
-            url: r.url,
-            title: r.title,
-            snippet: r.snippet,
-          })) ?? []
-        );
-      },
-    });
+    const tools = createSwarmTools(
+      this.state,
+      this.scrapeUseCase,
+      this.searchUseCase,
+      this.shouldCrawl.bind(this),
+    );
 
-    const scrapeUrl = tool({
-      description: "Scrape content from a URL",
-      inputSchema: z.object({
-        url: z.string().describe("URL to scrape"),
-      }),
-      execute: async ({ url }) => {
-        if (this.state.visited.has(url)) {
-          return { cached: true, url };
-        }
-
-        const response = await this.scrapeUseCase.execute(url);
-        this.state.visited.add(url);
-
-        const links =
-          response.result.links?.slice(0, 20).map((l) => l.href) ?? [];
-        const crawlResult: CrawlResult = {
-          url,
-          title: response.result.title,
-          content: response.result.content.slice(0, 5000),
-          links,
-          relevanceScore: 0.5,
-        };
-
-        this.state.results.set(url, crawlResult);
-
-        return {
-          title: crawlResult.title,
-          contentPreview: crawlResult.content.slice(0, 500),
-          linkCount: crawlResult.links.length,
-        };
-      },
-    });
-
-    const addToQueue = tool({
-      description: "Add URLs to crawl queue with priority",
-      inputSchema: z.object({
-        urls: z.array(
-          z.object({
-            url: z.string(),
-            priority: z.number().min(0).max(10),
-            reason: z.string().optional(),
-          }),
-        ),
-      }),
-      execute: async ({ urls }) => {
-        let added = 0;
-        for (const item of urls) {
-          if (!this.shouldCrawl(item.url)) continue;
-          if (this.state.visited.has(item.url)) continue;
-
-          this.state.queue.push({
-            url: item.url,
-            priority: item.priority,
-            depth: 0,
-            reason: item.reason,
-          });
-          added++;
-        }
-
-        this.state.queue.sort((a, b) => b.priority - a.priority);
-        return { added, queueSize: this.state.queue.length };
-      },
-    });
-
-    const getQueueStatus = tool({
-      description: "Get current queue and crawl status",
-      inputSchema: z.object({}),
-      execute: async () => ({
-        queueSize: this.state.queue.length,
-        visited: this.state.visited.size,
-        resultsCount: this.state.results.size,
-        nextUrls: this.state.queue.slice(0, 5).map((u) => u.url),
-      }),
-    });
-
-    const getResults = tool({
-      description: "Get all crawled results",
-      inputSchema: z.object({}),
-      execute: async () => {
-        return [...this.state.results.values()].map((r) => ({
-          url: r.url,
-          title: r.title,
-          contentPreview: r.content.slice(0, 200),
-        }));
-      },
-    });
-
-    const finishCrawl = tool({
-      description: "Call when you have gathered enough content for the goal",
-      inputSchema: z.object({
-        summary: z.string().describe("Summary of what was found"),
-      }),
-      execute: async ({ summary }) => ({ finished: true, summary }),
-    });
-
-    // Create orchestrator agent with ToolLoopAgent
     const orchestrator = new ToolLoopAgent({
       model: this.config.model,
       instructions: `You are a crawl orchestrator. Your job is to:
@@ -257,14 +131,7 @@ export class CrawlSwarm {
 4. Call finishCrawl when you have gathered enough content
 
 Always explain your reasoning briefly before taking action.`,
-      tools: {
-        searchWeb,
-        scrapeUrl,
-        addToQueue,
-        getQueueStatus,
-        getResults,
-        finishCrawl,
-      },
+      tools,
       stopWhen: stepCountIs(this.config.maxSteps),
       onStepFinish: (stepResult) => {
         onProgress?.({
@@ -277,7 +144,6 @@ Always explain your reasoning briefly before taking action.`,
       },
     });
 
-    // Run the agent
     const prompt =
       seedUrls.length > 0
         ? `Goal: ${goal}\n\nSeed URLs: ${seedUrls.join(", ")}\n\nCrawl these URLs and find relevant content.`
@@ -291,9 +157,13 @@ Always explain your reasoning briefly before taking action.`,
     };
   }
 
-  /** Reset swarm state */
+  /** Reset swarm state. */
   reset(): void {
-    this.state = {
+    this.state = this.createInitialState();
+  }
+
+  private createInitialState(): SwarmState {
+    return {
       queue: [],
       visited: new Set(),
       results: new Map(),
@@ -302,9 +172,7 @@ Always explain your reasoning briefly before taking action.`,
   }
 }
 
-/**
- * Create a crawl swarm
- */
+/** Create a crawl swarm. */
 export function createCrawlSwarm(config: SwarmConfig): CrawlSwarm {
   return new CrawlSwarm(config);
 }

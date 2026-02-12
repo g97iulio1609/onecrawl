@@ -1,6 +1,5 @@
 /**
  * Fetch-based Scraper Adapter
- * Lightweight scraper using native fetch for simple cases.
  */
 
 import type { ScraperPort, ScrapeResponse } from "../../ports/index.js";
@@ -21,14 +20,7 @@ import {
 import { getRandomUserAgent } from "../../utils/stealth.js";
 import { batchScrape } from "../shared/batch-scrape.js";
 
-/**
- * FetchScraperAdapter - Lightweight scraper for simple cases
- *
- * Use this when:
- * - Target site doesn't require JavaScript rendering
- * - You want faster, lighter scraping
- * - Playwright is not available
- */
+/** Lightweight scraper for sites that don't require JS rendering. */
 export class FetchScraperAdapter implements ScraperPort {
   private cache = new Map<string, { data: ScrapeResult; timestamp: number }>();
   private cacheTTL: number;
@@ -186,22 +178,14 @@ export class FetchScraperAdapter implements ScraperPort {
     });
   }
 
-  async isAvailable(): Promise<boolean> {
-    return true; // fetch is always available
-  }
+  async isAvailable(): Promise<boolean> { return true; }
 
-  getName(): string {
-    return "fetch";
-  }
+  getName(): string { return "fetch"; }
 
-  clearCache(): void {
-    this.cache.clear();
-  }
+  clearCache(): void { this.cache.clear(); }
 }
 
-/**
- * Create a fetch-based scraper adapter
- */
+/** Create a fetch-based scraper adapter */
 export function createFetchScraperAdapter(): ScraperPort {
   return new FetchScraperAdapter();
 }

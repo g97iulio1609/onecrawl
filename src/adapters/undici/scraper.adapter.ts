@@ -3,7 +3,6 @@
  * High-performance scraper with HTTP/2 multiplexing and connection pooling.
  */
 
-import { Pool } from "undici";
 import type { ScraperPort, ScrapeResponse } from "../../ports/index.js";
 import type {
   ScrapeResult,
@@ -12,15 +11,10 @@ import type {
   BatchOptions,
   ProgressCallback,
 } from "../../domain/schemas.js";
-import {
-  htmlToText,
-  htmlToMarkdown,
-  extractLinks,
-  extractMedia,
-  extractMetadata,
-} from "../../utils/content-parser.js";
 import { getRandomUserAgent } from "../../utils/stealth.js";
 import { batchScrape } from "../shared/batch-scrape.js";
+import { PoolManager } from "./pool-manager.js";
+import { parseUndiciResponse } from "./response-handler.js";
 
 /** LRU-style cache entry */
 interface CacheEntry {
@@ -30,9 +24,9 @@ interface CacheEntry {
   lastModified?: string;
 }
 
-/** Connection pool per origin — instance-scoped */
+/** Connection pool per origin - instance-scoped */
 export class UndiciScraperAdapter implements ScraperPort {
-  private pools = new Map<string, Pool>();
+  private poolManager = new PoolManager();
   private cache = new Map<string, CacheEntry>();
   private cacheTTL: number;
   private maxCacheSize: number;
@@ -41,20 +35,6 @@ export class UndiciScraperAdapter implements ScraperPort {
   constructor(options: { cacheTTL?: number; maxCacheSize?: number } = {}) {
     this.cacheTTL = options.cacheTTL ?? 30 * 60 * 1000;
     this.maxCacheSize = options.maxCacheSize ?? 500;
-  }
-
-  private getPool(origin: string): Pool {
-    let pool = this.pools.get(origin);
-    if (!pool) {
-      pool = new Pool(origin, {
-        connections: 10,
-        pipelining: 6,
-        keepAliveTimeout: 30000,
-        keepAliveMaxTimeout: 60000,
-      });
-      this.pools.set(origin, pool);
-    }
-    return pool;
   }
 
   async scrape(
@@ -76,181 +56,81 @@ export class UndiciScraperAdapter implements ScraperPort {
 
     const startTime = Date.now();
 
-    // Request deduplication - don't fetch same URL twice simultaneously
     const pending = this.pendingRequests.get(url);
-    if (pending) {
-      return pending;
-    }
+    if (pending) return pending;
 
-    // Check cache with conditional request support
     const cached = useCache ? this.cache.get(url) : undefined;
     if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
       onProgress?.({ phase: "complete", message: "From cache", url });
-      return {
-        result: cached.data,
-        cached: true,
-        duration: Date.now() - startTime,
-        source: this.getName(),
-      };
+      return { result: cached.data, cached: true, duration: Date.now() - startTime, source: this.getName() };
     }
 
-    if (signal?.aborted) {
-      throw new Error("Scrape aborted");
-    }
+    if (signal?.aborted) throw new Error("Scrape aborted");
 
     const requestPromise = this.executeRequest(url, {
-      timeout,
-      shouldExtractMedia,
-      shouldExtractLinks,
-      shouldExtractMetadata,
-      useCache,
-      onProgress,
-      signal,
-      startTime,
-      cached,
+      timeout, shouldExtractMedia, shouldExtractLinks,
+      shouldExtractMetadata, useCache, onProgress, signal, startTime, cached,
     });
 
     this.pendingRequests.set(url, requestPromise);
-
-    try {
-      return await requestPromise;
-    } finally {
-      this.pendingRequests.delete(url);
-    }
+    try { return await requestPromise; } finally { this.pendingRequests.delete(url); }
   }
 
   private async executeRequest(
     url: string,
     opts: {
-      timeout: number;
-      shouldExtractMedia: boolean;
-      shouldExtractLinks: boolean;
-      shouldExtractMetadata: boolean;
-      useCache: boolean;
-      onProgress?: ProgressCallback;
-      signal?: AbortSignal;
-      startTime: number;
-      cached?: CacheEntry;
+      timeout: number; shouldExtractMedia: boolean; shouldExtractLinks: boolean;
+      shouldExtractMetadata: boolean; useCache: boolean;
+      onProgress?: ProgressCallback; signal?: AbortSignal;
+      startTime: number; cached?: CacheEntry;
     },
   ): Promise<ScrapeResponse> {
-    const { timeout, onProgress, signal, startTime, cached } = opts;
-
+    const { timeout, onProgress, startTime, cached } = opts;
     onProgress?.({ phase: "starting", message: `Fetching ${url}...`, url });
 
     const parsedUrl = new URL(url);
-    const origin = parsedUrl.origin;
-
-    // Build conditional request headers
     const headers: Record<string, string> = {
       "User-Agent": getRandomUserAgent(),
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
       "Accept-Encoding": "gzip, deflate",
     };
+    if (cached?.etag) headers["If-None-Match"] = cached.etag;
+    if (cached?.lastModified) headers["If-Modified-Since"] = cached.lastModified;
 
-    // Add conditional headers if we have cached version
-    if (cached?.etag) {
-      headers["If-None-Match"] = cached.etag;
-    }
-    if (cached?.lastModified) {
-      headers["If-Modified-Since"] = cached.lastModified;
-    }
-
-    const pool = this.getPool(origin);
+    const pool = this.poolManager.getPool(parsedUrl.origin);
     const response = await pool.request({
       path: parsedUrl.pathname + parsedUrl.search,
-      method: "GET",
-      headers,
-      headersTimeout: timeout,
-      bodyTimeout: timeout,
+      method: "GET", headers, headersTimeout: timeout, bodyTimeout: timeout,
     });
 
-    // Handle 304 Not Modified - use cached version
     if (response.statusCode === 304 && cached) {
       onProgress?.({ phase: "complete", message: "Not modified", url });
-      return {
-        result: cached.data,
-        cached: true,
-        duration: Date.now() - startTime,
-        source: this.getName(),
-      };
+      return { result: cached.data, cached: true, duration: Date.now() - startTime, source: this.getName() };
     }
+    if (response.statusCode >= 400) throw new Error(`HTTP ${response.statusCode}`);
 
-    if (response.statusCode >= 400) {
-      throw new Error(`HTTP ${response.statusCode}`);
-    }
+    onProgress?.({ phase: "extracting", message: "Extracting content...", url });
+    const result = await parseUndiciResponse(response, url, startTime, opts);
 
-    onProgress?.({
-      phase: "extracting",
-      message: "Extracting content...",
-      url,
-    });
-
-    const html = await response.body.text();
-    const contentType = (response.headers["content-type"] as string) || "";
-
-    // Extract title
-    const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
-    const title = titleMatch ? htmlToText(titleMatch[1] || "") : "";
-
-    const result: ScrapeResult = {
-      url: response.headers["location"]
-        ? new URL(response.headers["location"] as string, url).href
-        : url,
-      title,
-      content: htmlToText(html),
-      markdown: htmlToMarkdown(html),
-      html,
-      statusCode: response.statusCode,
-      contentType,
-      loadTime: Date.now() - startTime,
-    };
-
-    if (opts.shouldExtractLinks) {
-      result.links = extractLinks(html, url);
-    }
-
-    if (opts.shouldExtractMedia) {
-      result.media = extractMedia(html, url);
-    }
-
-    if (opts.shouldExtractMetadata) {
-      result.metadata = extractMetadata(html);
-    }
-
-    // Cache with ETag/Last-Modified for conditional requests
     if (opts.useCache) {
       this.setCache(url, {
-        data: result,
-        timestamp: Date.now(),
+        data: result, timestamp: Date.now(),
         etag: response.headers["etag"] as string | undefined,
         lastModified: response.headers["last-modified"] as string | undefined,
       });
     }
 
-    onProgress?.({
-      phase: "complete",
-      message: `Fetched ${result.content.length} chars`,
-      url,
-    });
-
-    return {
-      result,
-      cached: false,
-      duration: Date.now() - startTime,
-      source: this.getName(),
-    };
+    onProgress?.({ phase: "complete", message: `Fetched ${result.content.length} chars`, url });
+    return { result, cached: false, duration: Date.now() - startTime, source: this.getName() };
   }
 
   private setCache(url: string, entry: CacheEntry): void {
-    // Evict oldest entries if cache is full
     if (this.cache.size >= this.maxCacheSize) {
       const oldest = [...this.cache.entries()]
         .sort((a, b) => a[1].timestamp - b[1].timestamp)
         .slice(0, Math.floor(this.maxCacheSize * 0.1));
-      for (const [key] of oldest) {
-        this.cache.delete(key);
-      }
+      for (const [key] of oldest) this.cache.delete(key);
     }
     this.cache.set(url, entry);
   }
@@ -258,50 +138,30 @@ export class UndiciScraperAdapter implements ScraperPort {
   async scrapeMany(
     urls: string[],
     options: Partial<ScrapeOptions & BatchOptions> & {
-      onProgress?: ProgressCallback;
-      signal?: AbortSignal;
+      onProgress?: ProgressCallback; signal?: AbortSignal;
     } = {},
   ): Promise<BatchScrapeResult> {
-    const {
-      concurrency = 10,
-      retries = 2,
-      retryDelay = 1000,
-      onProgress,
-      signal,
-      ...scrapeOptions
-    } = options;
-
+    const { concurrency = 10, retries = 2, retryDelay = 1000, onProgress, signal, ...scrapeOptions } = options;
     const startTime = Date.now();
     const failed = new Map<string, Error>();
 
-    // Group URLs by origin for optimal connection reuse
     const byOrigin = new Map<string, string[]>();
     for (const url of urls) {
       try {
-        const origin = new URL(url).origin;
-        const group = byOrigin.get(origin) || [];
+        const group = byOrigin.get(new URL(url).origin) || [];
         group.push(url);
-        byOrigin.set(origin, group);
-      } catch {
-        failed.set(url, new Error("Invalid URL"));
-      }
+        byOrigin.set(new URL(url).origin, group);
+      } catch { failed.set(url, new Error("Invalid URL")); }
     }
 
-    // Process each origin group using shared batchScrape
     const batchResults = await Promise.all(
       [...byOrigin.values()].map((originUrls) =>
         batchScrape(originUrls, this.scrape.bind(this), {
-          concurrency,
-          retries,
-          retryDelay,
-          onProgress,
-          signal,
-          scrapeOptions,
+          concurrency, retries, retryDelay, onProgress, signal, scrapeOptions,
         }),
       ),
     );
 
-    // Merge results from all origin groups
     const results = new Map<string, ScrapeResult>();
     for (const batch of batchResults) {
       for (const [url, result] of batch.results) results.set(url, result);
@@ -313,27 +173,15 @@ export class UndiciScraperAdapter implements ScraperPort {
       message: `Completed: ${results.size} success, ${failed.size} failed`,
       url: urls[0]!,
     });
-
     return { results, failed, totalDuration: Date.now() - startTime };
   }
 
-  async isAvailable(): Promise<boolean> {
-    return true;
-  }
+  async isAvailable(): Promise<boolean> { return true; }
+  getName(): string { return "undici"; }
+  clearCache(): void { this.cache.clear(); }
 
-  getName(): string {
-    return "undici";
-  }
-
-  clearCache(): void {
-    this.cache.clear();
-  }
-
-  /** Close all connection pools */
   async close(): Promise<void> {
-    const closePromises = [...this.pools.values()].map((pool) => pool.close());
-    await Promise.all(closePromises);
-    this.pools.clear();
+    await this.poolManager.closeAll();
   }
 }
 

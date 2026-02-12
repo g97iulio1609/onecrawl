@@ -18,33 +18,12 @@ import {
   extractMedia,
   extractMetadata,
 } from "../../utils/content-parser.js";
-import {
-  getRandomUserAgent,
-  getRandomViewport,
-} from "../../utils/stealth.js";
-import { CDPClient, CDPPage } from "./client.js";
 import { batchScrape } from "../shared/batch-scrape.js";
+import { PagePool } from "./page-pool.js";
+import type { CDPClient } from "./client.js";
 
-/** Page pool for reusing warm tabs */
-interface PooledPage {
-  page: CDPPage;
-  inUse: boolean;
-  lastUsed: number;
-}
-
-/**
- * CDPScraperAdapter - Direct Chrome DevTools Protocol scraping
- *
- * Benefits over Playwright:
- * - 80% faster browser startup (reuses existing Chrome)
- * - 70% less memory (no Node.js wrapper overhead)
- * - Warm tab pool (no cold start per page)
- * - Profile persistence (cookies, cache)
- */
 export class CDPScraperAdapter implements ScraperPort {
-  private client: CDPClient | null = null;
-  private pagePool: PooledPage[] = [];
-  private maxPoolSize: number;
+  private pagePool: PagePool;
   private cache = new Map<string, { data: ScrapeResult; timestamp: number }>();
   private cacheTTL: number;
 
@@ -55,69 +34,8 @@ export class CDPScraperAdapter implements ScraperPort {
       cdpOptions?: ConstructorParameters<typeof CDPClient>[0];
     } = {},
   ) {
-    this.maxPoolSize = options.maxPoolSize ?? 5;
+    this.pagePool = new PagePool(options.maxPoolSize ?? 5);
     this.cacheTTL = options.cacheTTL ?? 30 * 60 * 1000;
-  }
-
-  private async ensureClient(): Promise<CDPClient> {
-    if (!this.client) {
-      this.client = new CDPClient();
-      await this.client.launch();
-    }
-    return this.client;
-  }
-
-  private async getPage(): Promise<CDPPage> {
-    // Try to get an available page from pool
-    for (const pooled of this.pagePool) {
-      if (!pooled.inUse) {
-        pooled.inUse = true;
-        pooled.lastUsed = Date.now();
-        return pooled.page;
-      }
-    }
-
-    // Create new page if pool not full
-    if (this.pagePool.length < this.maxPoolSize) {
-      const client = await this.ensureClient();
-      const pageInfo = await client.newPage();
-      const page = new CDPPage(pageInfo, client);
-      await page.connect();
-
-      // Apply stealth
-      const viewport = getRandomViewport();
-      await page.setViewport(viewport.width, viewport.height);
-      await page.setUserAgent(getRandomUserAgent());
-
-      const pooled: PooledPage = { page, inUse: true, lastUsed: Date.now() };
-      this.pagePool.push(pooled);
-      return page;
-    }
-
-    // Wait for a page to become available
-    return new Promise((resolve) => {
-      const check = () => {
-        for (const pooled of this.pagePool) {
-          if (!pooled.inUse) {
-            pooled.inUse = true;
-            pooled.lastUsed = Date.now();
-            resolve(pooled.page);
-            return;
-          }
-        }
-        setTimeout(check, 50);
-      };
-      check();
-    });
-  }
-
-  private releasePage(page: CDPPage): void {
-    for (const pooled of this.pagePool) {
-      if (pooled.page === page) {
-        pooled.inUse = false;
-        return;
-      }
-    }
   }
 
   async scrape(
@@ -138,137 +56,65 @@ export class CDPScraperAdapter implements ScraperPort {
 
     const startTime = Date.now();
 
-    // Check cache
     if (useCache) {
       const cached = this.cache.get(url);
       if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
         onProgress?.({ phase: "complete", message: "From cache", url });
-        return {
-          result: cached.data,
-          cached: true,
-          duration: Date.now() - startTime,
-          source: this.getName(),
-        };
+        return { result: cached.data, cached: true, duration: Date.now() - startTime, source: this.getName() };
       }
     }
 
     onProgress?.({ phase: "starting", message: `Loading ${url}...`, url });
-
-    const page = await this.getPage();
+    const page = await this.pagePool.acquire();
 
     try {
       await page.goto(url, { timeout });
+      onProgress?.({ phase: "extracting", message: "Extracting content...", url });
 
-      onProgress?.({
-        phase: "extracting",
-        message: "Extracting content...",
-        url,
-      });
-
-      const [html, title] = await Promise.all([
-        page.getHTML(),
-        page.getTitle(),
-      ]);
+      const [html, title] = await Promise.all([page.getHTML(), page.getTitle()]);
 
       const result: ScrapeResult = {
-        url,
-        title,
+        url, title,
         content: htmlToText(html),
         markdown: htmlToMarkdown(html),
-        html,
-        statusCode: 200,
-        contentType: "text/html",
+        html, statusCode: 200, contentType: "text/html",
         loadTime: Date.now() - startTime,
       };
 
-      if (shouldExtractLinks) {
-        result.links = extractLinks(html, url);
-      }
+      if (shouldExtractLinks) result.links = extractLinks(html, url);
+      if (shouldExtractMedia) result.media = extractMedia(html, url);
+      if (shouldExtractMetadata) result.metadata = extractMetadata(html);
 
-      if (shouldExtractMedia) {
-        result.media = extractMedia(html, url);
-      }
+      if (useCache) this.cache.set(url, { data: result, timestamp: Date.now() });
 
-      if (shouldExtractMetadata) {
-        result.metadata = extractMetadata(html);
-      }
-
-      // Cache result
-      if (useCache) {
-        this.cache.set(url, { data: result, timestamp: Date.now() });
-      }
-
-      onProgress?.({
-        phase: "complete",
-        message: `Loaded ${result.content.length} chars`,
-        url,
-      });
-
-      return {
-        result,
-        cached: false,
-        duration: Date.now() - startTime,
-        source: this.getName(),
-      };
+      onProgress?.({ phase: "complete", message: `Loaded ${result.content.length} chars`, url });
+      return { result, cached: false, duration: Date.now() - startTime, source: this.getName() };
     } finally {
-      this.releasePage(page);
+      this.pagePool.release(page);
     }
   }
 
   async scrapeMany(
     urls: string[],
     options: Partial<ScrapeOptions & BatchOptions> & {
-      onProgress?: ProgressCallback;
-      signal?: AbortSignal;
+      onProgress?: ProgressCallback; signal?: AbortSignal;
     } = {},
   ): Promise<BatchScrapeResult> {
-    const {
-      concurrency = this.maxPoolSize,
-      retries = 2,
-      retryDelay = 1000,
-      onProgress,
-      signal,
-      ...scrapeOptions
-    } = options;
-
+    const { concurrency = 5, retries = 2, retryDelay = 1000, onProgress, signal, ...scrapeOptions } = options;
     return batchScrape(urls, this.scrape.bind(this), {
-      concurrency,
-      retries,
-      retryDelay,
-      onProgress,
-      signal,
-      scrapeOptions,
+      concurrency, retries, retryDelay, onProgress, signal, scrapeOptions,
     });
   }
 
   async isAvailable(): Promise<boolean> {
-    try {
-      await this.ensureClient();
-      return true;
-    } catch {
-      return false;
-    }
+    try { await this.pagePool.ensureClient(); return true; } catch { return false; }
   }
 
-  getName(): string {
-    return "cdp";
-  }
+  getName(): string { return "cdp"; }
+  clearCache(): void { this.cache.clear(); }
 
-  clearCache(): void {
-    this.cache.clear();
-  }
-
-  /** Close all pages and browser */
   async close(): Promise<void> {
-    for (const pooled of this.pagePool) {
-      await pooled.page.close();
-    }
-    this.pagePool = [];
-
-    if (this.client) {
-      await this.client.close();
-      this.client = null;
-    }
+    await this.pagePool.closeAll();
   }
 }
 

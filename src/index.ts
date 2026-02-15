@@ -47,6 +47,15 @@ export {
   sleep,
 } from "./utils/stealth.js";
 
+export {
+  extractToolsFromHTML,
+  extractInternalLinks,
+  globToRegex,
+  matchesPatterns,
+} from "./utils/semantic-extractor.js";
+
+export { SemanticCrawlUseCase } from "./use-cases/semantic-crawl.use-case.js";
+
 // Convenience factory function
 import { createScrapeUseCase, createSearchUseCase } from "./use-cases/index.js";
 

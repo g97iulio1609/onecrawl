@@ -16,8 +16,11 @@ import {
   getRandomUserAgent,
   getRandomViewport,
   getStealthScript,
+  getRandomTimezone,
+  generateFingerprint,
   sleep,
 } from "../../utils/stealth.js";
+import type { Fingerprint } from "../../utils/stealth.js";
 
 /** Options controlling what to extract from a page. */
 export interface PageScrapeOptions {
@@ -51,14 +54,20 @@ export async function launchBrowser(): Promise<Browser> {
 /** Create a stealth browser context with randomised fingerprints. */
 export async function createStealthContext(
   browser: Browser,
+  fp?: Fingerprint,
 ): Promise<BrowserContext> {
+  const fingerprint = fp ?? generateFingerprint();
   return browser.newContext({
-    viewport: getRandomViewport(),
-    userAgent: getRandomUserAgent(),
-    locale: "en-US",
-    timezoneId: "America/New_York",
-    deviceScaleFactor: 1,
+    viewport: fingerprint.viewport,
+    userAgent: fingerprint.userAgent,
+    locale: fingerprint.locale,
+    timezoneId: fingerprint.timezoneId,
+    deviceScaleFactor: fingerprint.deviceScaleFactor,
     javaScriptEnabled: true,
+    bypassCSP: true,
+    extraHTTPHeaders: {
+      "Accept-Language": fingerprint.locale + ",en;q=0.9",
+    },
   });
 }
 
@@ -67,9 +76,9 @@ export async function scrapePage(
   page: Page,
   url: string,
   startTime: number,
-  opts: PageScrapeOptions,
+  opts: PageScrapeOptions & { fingerprint?: Fingerprint },
 ): Promise<{ result: ScrapeResult; response: Response | null }> {
-  await page.addInitScript(getStealthScript());
+  await page.addInitScript(getStealthScript(opts.fingerprint));
 
   opts.onProgress?.({ phase: "navigating", message: "Loading page...", url });
 

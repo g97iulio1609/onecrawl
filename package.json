@@ -1,6 +1,6 @@
 {
   "name": "@giulio-leone/onecrawl",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Native TypeScript web crawler and scraper. Zero Python dependencies.",
   "type": "module",
   "main": "dist/index.js",
@@ -79,7 +79,9 @@
     "playwright": "^1.50.0",
     "undici": "^7.19.1",
     "ws": "^8.19.0",
-    "turndown": "^7.2.0"
+    "turndown": "^7.2.0",
+    "playwright-core": "^1.50.0",
+    "@sparticuz/chromium": "^133.0.0"
   },
   "peerDependencies": {
     "ai": "^6.0.68",

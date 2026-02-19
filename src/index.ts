@@ -44,8 +44,12 @@ export {
   getRandomViewport,
   getStealthScript,
   getRandomDelay,
+  getRandomTimezone,
+  generateFingerprint,
   sleep,
 } from "./utils/stealth.js";
+
+export type { Fingerprint } from "./utils/stealth.js";
 
 export {
   extractToolsFromHTML,

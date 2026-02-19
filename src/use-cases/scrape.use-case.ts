@@ -12,43 +12,45 @@ import type {
 import { PlaywrightScraperAdapter } from "../adapters/playwright/scraper.adapter.js";
 import { FetchScraperAdapter } from "../adapters/fetch/scraper.adapter.js";
 import { UndiciScraperAdapter } from "../adapters/undici/scraper.adapter.js";
+import { BrowserScraperAdapter } from "../adapters/browser/scraper.adapter.js";
+import type { BrowserScraperOptions } from "../adapters/browser/scraper.adapter.js";
 
 export interface ScrapeUseCaseOptions extends Partial<ScrapeOptions> {
-  /**
-   * Prefer Playwright for JS-heavy sites
-   */
+  /** Prefer browser (Playwright or Browser adapter) for JS-heavy sites. */
   preferBrowser?: boolean;
 
-  /**
-   * Use HTTP/2 with undici (faster for batch requests)
-   */
+  /** Use HTTP/2 with undici (faster for batch requests). */
   useHttp2?: boolean;
 
-  /**
-   * Fallback to fetch if browser unavailable
-   */
+  /** Fallback to fetch if browser unavailable. */
   fallbackToFetch?: boolean;
 
-  /**
-   * Progress callback
-   */
+  /** Progress callback. */
   onProgress?: ProgressCallback;
 
-  /**
-   * Abort signal
-   */
+  /** Abort signal. */
   signal?: AbortSignal;
+}
+
+/** Options for the ScrapeUseCase constructor. */
+export interface ScrapeUseCaseConfig {
+  /** BrowserScraperAdapter options (CDP endpoint, etc.). */
+  browser?: BrowserScraperOptions;
 }
 
 /**
  * ScrapeUseCase - Intelligent scraping with fallback
+ *
+ * Fallback chain: Browser (CDP/stealth) → Playwright → undici → fetch
  */
 export class ScrapeUseCase {
+  private browserScraper: ScraperPort;
   private playwrightScraper: ScraperPort;
   private fetchScraper: ScraperPort;
   private undiciScraper: ScraperPort;
 
-  constructor() {
+  constructor(config: ScrapeUseCaseConfig = {}) {
+    this.browserScraper = new BrowserScraperAdapter(config.browser);
     this.playwrightScraper = new PlaywrightScraperAdapter();
     this.fetchScraper = new FetchScraperAdapter();
     this.undiciScraper = new UndiciScraperAdapter();
@@ -73,16 +75,15 @@ export class ScrapeUseCase {
     const needsBrowser = preferBrowser || waitFor === "networkidle";
 
     if (needsBrowser) {
-      try {
-        if (await this.playwrightScraper.isAvailable()) {
-          return await this.playwrightScraper.scrape(url, {
-            ...scrapeOptions,
-            waitFor,
-          });
+      // Try Browser adapter first (CDP/stealth), then Playwright
+      for (const scraper of [this.browserScraper, this.playwrightScraper]) {
+        try {
+          if (await scraper.isAvailable()) {
+            return await scraper.scrape(url, { ...scrapeOptions, waitFor });
+          }
+        } catch (error) {
+          if (!fallbackToFetch) throw error;
         }
-      } catch (error) {
-        if (!fallbackToFetch) throw error;
-        // Fall through to HTTP scraper
       }
     }
 
@@ -110,7 +111,10 @@ export class ScrapeUseCase {
     // For batch scraping, prefer undici (HTTP/2 connection pooling)
     let scraper: ScraperPort;
     if (preferBrowser) {
-      scraper = this.playwrightScraper;
+      // Try browser adapter first, then playwright
+      scraper = (await this.browserScraper.isAvailable())
+        ? this.browserScraper
+        : this.playwrightScraper;
     } else if (useHttp2) {
       scraper = this.undiciScraper;
     } else {
@@ -132,6 +136,9 @@ export class ScrapeUseCase {
   async getAvailableScrapers(): Promise<string[]> {
     const available: string[] = ["fetch", "undici"];
 
+    if (await this.browserScraper.isAvailable()) {
+      available.push("browser");
+    }
     if (await this.playwrightScraper.isAvailable()) {
       available.push("playwright");
     }

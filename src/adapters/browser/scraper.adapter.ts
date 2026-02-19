@@ -92,15 +92,23 @@ export class BrowserScraperAdapter implements ScraperPort {
   }
 
   private async connectCDP(endpoint: string): Promise<Browser | null> {
-    try {
-      const { chromium } = await import("playwright-core");
-      const url = /^\d+$/.test(endpoint)
-        ? `http://localhost:${endpoint}`
-        : endpoint;
-      return await chromium.connectOverCDP(url);
-    } catch {
-      return null;
+    const { chromium } = await import("playwright-core");
+    const url = /^\d+$/.test(endpoint)
+      ? `http://127.0.0.1:${endpoint}`
+      : endpoint;
+    // Try both the provided URL and 127.0.0.1 fallback (IPv6 resolver issue)
+    const urls = [url];
+    if (url.includes("localhost")) {
+      urls.push(url.replace("localhost", "127.0.0.1"));
     }
+    for (const u of urls) {
+      try {
+        return await chromium.connectOverCDP(u);
+      } catch {
+        continue;
+      }
+    }
+    return null;
   }
 
   private async launchSparticuz(): Promise<Browser | null> {
@@ -125,7 +133,9 @@ export class BrowserScraperAdapter implements ScraperPort {
 
   private async launchLocal(): Promise<Browser> {
     const { chromium } = await import("playwright-core");
+    const executablePath = this.findChromePath();
     return chromium.launch({
+      executablePath,
       headless: this.opts.headless,
       args: [
         "--no-sandbox",
@@ -138,6 +148,31 @@ export class BrowserScraperAdapter implements ScraperPort {
         "--disable-blink-features=AutomationControlled",
       ],
     });
+  }
+
+  /** Detect system Chrome/Chromium executable. */
+  private findChromePath(): string | undefined {
+    const { platform } = process;
+    const paths =
+      platform === "darwin"
+        ? [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+          ]
+        : platform === "win32"
+          ? [
+              "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+              "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            ]
+          : [
+              "/usr/bin/google-chrome",
+              "/usr/bin/google-chrome-stable",
+              "/usr/bin/chromium",
+              "/usr/bin/chromium-browser",
+            ];
+    const { existsSync } = require("node:fs") as typeof import("node:fs");
+    return paths.find((p) => existsSync(p));
   }
 
   // ── Stealth context ─────────────────────────────────────────────────────

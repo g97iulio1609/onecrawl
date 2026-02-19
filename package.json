@@ -1,5 +1,5 @@
 {
-  "name": "onecrawl",
+  "name": "@giulio-leone/onecrawl",
   "version": "1.1.0",
   "description": "Native TypeScript web crawler and scraper. Zero Python dependencies.",
   "type": "module",
@@ -126,10 +126,10 @@
   "author": "OneGenUI",
   "license": "MIT",
   "publishConfig": {
-    "access": "public"
+    "registry": "https://npm.pkg.github.com"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/g97iulio1609/onecrawl.git"
+    "url": "https://github.com/giulio-leone/onecrawl.git"
   }
 }
